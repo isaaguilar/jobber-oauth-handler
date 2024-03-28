@@ -1,6 +1,7 @@
 use aws_sdk_s3 as s3;
 use base64::{engine::general_purpose, Engine as _};
 use lambda_http::{service_fn, Error, Request, RequestExt, Response};
+use reqwest::StatusCode;
 use serde::Deserialize;
 use std::env;
 use std::fmt;
@@ -51,45 +52,88 @@ async fn main() -> Result<(), Error> {
 }
 
 async fn hello(request: Request) -> Result<Response<String>, Error> {
-    let mut config = aws_config::load_from_env().await;
-    // aws_config::Region::new("us-west-2");
-
-    let client = s3::Client::new(&config);
-
     let _context = request.lambda_context_ref();
 
-    let code = request
+    println!("Setting up s3 client");
+    let config = aws_config::load_from_env().await;
+    let client = s3::Client::new(&config);
+
+    println!("Parsing data from url");
+    let code = match request
         .query_string_parameters_ref()
         .and_then(|params| params.first("code"))
-        .ok_or(Error::from("missing authorization code"))?;
+    {
+        Some(s) => s,
+        None => return respond_with_message(StatusCode::UNPROCESSABLE_ENTITY, "missing code"),
+    };
 
-    let redirect_uri = request
+    let redirect_uri = match request
         .query_string_parameters_ref()
         .and_then(|params| params.first("redirect_uri"))
-        .ok_or(Error::from("missing redirect_uri"))?;
+    {
+        Some(s) => s,
+        None => {
+            return respond_with_message(StatusCode::UNPROCESSABLE_ENTITY, "missing redirect_uri")
+        }
+    };
 
-    let client_id = request
+    let client_id = match request
         .query_string_parameters_ref()
         .and_then(|params| params.first("client_id"))
-        .ok_or(Error::from("missing client_id"))?;
+    {
+        Some(s) => s,
+        None => return respond_with_message(StatusCode::UNPROCESSABLE_ENTITY, "missing client_id"),
+    };
 
-    let client_secret = env::var("CLIENT_SECRET")?;
-    let bucket = env::var("S3_BUCKET")?;
+    println!("Loading environment variables");
+    let client_secret = match env::var("CLIENT_SECRET") {
+        Ok(s) => s,
+        Err(e) => {
+            return respond_with_message(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!("missing CLIENT_SECRET: {}", e.to_string()),
+            )
+        }
+    };
+    let bucket = match env::var("S3_BUCKET") {
+        Ok(s) => s,
+        Err(e) => {
+            return respond_with_message(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!("missing S3_BUCKET: {}", e.to_string()),
+            )
+        }
+    };
 
     let encoded_key = code.split('.').nth(1).unwrap();
-    let decoded_key = general_purpose::STANDARD.decode(encoded_key).unwrap();
-
-    let value: JwtKeyData = serde_json::from_slice(decoded_key.as_slice()).unwrap();
-
-    let keys = match awss3::list_objects(&client, &bucket).await {
-        Ok(list) => list,
+    let decoded_key = match general_purpose::STANDARD.decode(encoded_key) {
+        Ok(s) => s,
         Err(e) => {
-            let resp = Response::builder()
-                .status(404)
-                .header("content-type", "application/json")
-                .body(e.to_string())
-                .map_err(Box::new)?;
-            return Ok(resp);
+            return respond_with_message(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!("failed to decode authorization code: {}", e.to_string()),
+            )
+        }
+    };
+    let value: JwtKeyData = match serde_json::from_slice(decoded_key.as_slice()) {
+        Ok(s) => s,
+        Err(e) => {
+            return respond_with_message(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!(
+                    "failed to parse authorization code into json: {}",
+                    e.to_string()
+                ),
+            )
+        }
+    };
+    let keys = match awss3::list_objects(&client, &bucket).await {
+        Ok(s) => s,
+        Err(e) => {
+            return respond_with_message(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!("failed to list s3 bucket: {}", e.to_string()),
+            )
         }
     };
     let key = &format!("jobber-tokens/{}/{}.json", &value.app_id, &value.user_id);
@@ -97,22 +141,61 @@ async fn hello(request: Request) -> Result<Response<String>, Error> {
     let token_data = if keys.contains(key) {
         println!("Found token");
         let data = match awss3::get_object(&client, &bucket, key).await {
-            Ok((_size, bytes)) => bytes,
+            Ok((_, s)) => s,
             Err(e) => {
-                let resp = Response::builder()
-                    .status(404)
-                    .header("content-type", "application/json")
-                    .body(e.to_string())
-                    .map_err(Box::new)?;
-                return Ok(resp);
+                return respond_with_message(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    &format!("failed to fetch item from s3: {}", e.to_string()),
+                )
             }
         };
 
-        let json_token: Token = serde_json::from_slice(&data).unwrap();
+        let json_token: Token = match serde_json::from_slice(&data) {
+            Ok(s) => s,
+            Err(e) => {
+                return respond_with_message(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    &format!(
+                        "failed to parse token data from s3 object: {}",
+                        e.to_string()
+                    ),
+                )
+            }
+        };
         let access_token = json_token.access_token;
-        let encoded_token = access_token.split('.').nth(1).unwrap();
-        let decoded_token = general_purpose::STANDARD.decode(encoded_token).unwrap();
-        let token_value: JwtKeyData = serde_json::from_slice(decoded_token.as_slice()).unwrap();
+        let encoded_token = match access_token.split('.').nth(1) {
+            Some(s) => s,
+            None => {
+                return respond_with_message(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "failed to extract the data section from the jwt token",
+                )
+            }
+        };
+        let decoded_token = match general_purpose::STANDARD.decode(encoded_token) {
+            Ok(s) => s,
+            Err(e) => {
+                return respond_with_message(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    &format!(
+                        "failed to decode the data section from the jwt token: {}",
+                        e.to_string()
+                    ),
+                )
+            }
+        };
+        let token_value: JwtKeyData = match serde_json::from_slice(decoded_token.as_slice()) {
+            Ok(s) => s,
+            Err(e) => {
+                return respond_with_message(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    &format!(
+                        "failed to parse to decoded data section from the jwt token: {}",
+                        e.to_string()
+                    ),
+                )
+            }
+        };
         if is_expired(token_value.exp + 1800) {
             println!("Token is expired. Using refresh token");
             let request_path = format!(
@@ -120,49 +203,57 @@ async fn hello(request: Request) -> Result<Response<String>, Error> {
                 client_id, &client_secret, json_token.refresh_token
             );
             match request_token(&request_path).await {
-                Ok(token) => token,
+                Ok(s) => s,
                 Err(e) => {
-                    let resp = Response::builder()
-                        .status(404)
-                        .header("content-type", "application/json")
-                        .body(e.to_string())
-                        .map_err(Box::new)?;
-                    return Ok(resp);
+                    return respond_with_message(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        &format!("failed to refresh token: {}", e.to_string()),
+                    )
                 }
             }
         } else {
-            String::from_utf8(data).unwrap()
+            match String::from_utf8(data) {
+                Ok(s) => s,
+                Err(e) => {
+                    return respond_with_message(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        &format!(
+                            "failed to convert s3 object back to string: {}",
+                            e.to_string()
+                        ),
+                    )
+                }
+            }
         }
     } else {
+        println!("Making a request for a new token");
         let request_query = format!(
             "client_id={}&client_secret={}&grant_type=authorization_code&code={}&redirect_uri={}",
             client_id, client_secret, code, redirect_uri
         );
         match request_token(&request_query).await {
-            Ok(response) => response,
+            Ok(s) => s,
             Err(e) => {
-                let resp = Response::builder()
-                    .status(404)
-                    .header("content-type", "application/json")
-                    .body(e.to_string())
-                    .map_err(Box::new)?;
-                return Ok(resp);
+                return respond_with_message(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    &format!("failed to get new token: {}", e.to_string()),
+                )
             }
         }
     };
 
+    println!("Uploading key to s3");
     match awss3::upload_object(&client, &bucket, &token_data, key).await {
-        Ok(_) => {}
+        Ok(s) => s,
         Err(e) => {
-            let resp = Response::builder()
-                .status(404)
-                .header("content-type", "application/json")
-                .body(e.to_string())
-                .map_err(Box::new)?;
-            return Ok(resp);
+            return respond_with_message(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!("failed to upload token data to s3: {}", e.to_string()),
+            )
         }
     }
 
+    println!("Finishing up...");
     let resp = Response::builder()
         .status(200)
         .header("content-type", "text/plain")
@@ -192,7 +283,7 @@ async fn request_token(
     {
         Ok(response) => response,
         Err(e) => {
-            return (Err(e.into()));
+            return Err(e.into());
         }
     };
 
@@ -200,4 +291,13 @@ async fn request_token(
         return Err(make_error(&response.text().await.unwrap()));
     }
     Ok(response.text().await.unwrap())
+}
+
+fn respond_with_message(status_code: StatusCode, msg: &str) -> Result<Response<String>, Error> {
+    let resp = Response::builder()
+        .status(status_code)
+        .header("content-type", "text/plain")
+        .body(msg.to_string())
+        .map_err(Box::new)?;
+    return Ok(resp);
 }
