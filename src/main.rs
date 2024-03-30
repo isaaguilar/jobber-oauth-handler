@@ -196,7 +196,7 @@ async fn hello(request: Request) -> Result<Response<String>, Error> {
                 )
             }
         };
-        if is_expired(token_value.exp + 1800) {
+        if is_expired(token_value.exp - 1800) {
             println!("Token is expired. Using refresh token");
             let request_path = format!(
                 "client_id={}&client_secret={}&grant_type=refresh_token&refresh_token={}",
@@ -204,11 +204,21 @@ async fn hello(request: Request) -> Result<Response<String>, Error> {
             );
             match request_token(&request_path).await {
                 Ok(s) => s,
-                Err(e) => {
-                    return respond_with_message(
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        &format!("failed to refresh token: {}", e.to_string()),
-                    )
+                Err(_) => {
+                    println!("Making a request for a new token");
+                    let request_query = format!(
+                        "client_id={}&client_secret={}&grant_type=authorization_code&code={}&redirect_uri={}",
+                        client_id, client_secret, code, redirect_uri
+                    );
+                    match request_token(&request_query).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return respond_with_message(
+                                StatusCode::UNPROCESSABLE_ENTITY,
+                                &format!("failed to get new token: {}", e.to_string()),
+                            )
+                        }
+                    }
                 }
             }
         } else {
