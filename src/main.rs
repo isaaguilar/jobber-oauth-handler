@@ -106,7 +106,7 @@ async fn hello(request: Request) -> Result<Response<String>, Error> {
     };
 
     let encoded_key = code.split('.').nth(1).unwrap();
-    let decoded_key = match general_purpose::STANDARD.decode(encoded_key) {
+    let decoded_key = match general_purpose::STANDARD_NO_PAD.decode(encoded_key) {
         Ok(s) => s,
         Err(e) => {
             return respond_with_message(
@@ -172,7 +172,7 @@ async fn hello(request: Request) -> Result<Response<String>, Error> {
                 )
             }
         };
-        let decoded_token = match general_purpose::STANDARD.decode(encoded_token) {
+        let decoded_token = match general_purpose::STANDARD_NO_PAD.decode(encoded_token) {
             Ok(s) => s,
             Err(e) => {
                 return respond_with_message(
