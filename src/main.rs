@@ -85,8 +85,16 @@ async fn hello(request: Request) -> Result<Response<String>, Error> {
         None => return respond_with_message(StatusCode::UNPROCESSABLE_ENTITY, "missing client_id"),
     };
 
+    let app_name = match request
+        .query_string_parameters_ref()
+        .and_then(|params| params.first("app_name"))
+    {
+        Some(s) => s,
+        None => return respond_with_message(StatusCode::UNPROCESSABLE_ENTITY, "missing appname"),
+    };
+
     println!("Loading environment variables");
-    let client_secret = match env::var("CLIENT_SECRET") {
+    let client_secret = match env::var(app_name) {
         Ok(s) => s,
         Err(e) => {
             return respond_with_message(
